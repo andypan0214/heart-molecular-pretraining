@@ -1,0 +1,83 @@
+# HEART general molecular pretraining -- 10-update GPU PILOT (engineering validation only).
+#
+# Submit (from /home/ypan/heart_liver/model/pretrain):
+#   sbatch scripts/pretrain_heart.sh configs/pilot.yaml
+#
+# Ten optimizer updates on real data prove that the pipeline runs; they do NOT
+# pretrain the model. Architecture and loss weights follow LUMI-lab
+# model/pretrain/pretrain.sh; only batch size, step counts, intervals,
+# workers and checkpoint retention are reduced for the pilot.
+
+launcher:
+  run_name: heart-gpu-pilot
+  # Read-only Uni-Mol ligand data (train.lmdb, valid.lmdb, dict.txt).
+  data_path: /home/ypan/heart_liver/model/UniMolReference/ligand_data/ligands
+  # Run directories are created below this path (quota ~300 GB in total).
+  output_root: /home/ypan/heart_liver/model/heart_training_runs
+  n_gpu: 1
+  # timestamped: <output_root>/<run_name>-<YYYYmmdd-HHMM>-j<jobid> (new dir per job)
+  # fixed:       <output_root>/<run_name> (resubmitting auto-resumes)
+  run_dir_mode: timestamped
+  # Stop cleanly (validate + checkpoint_last.pt) this many minutes before the
+  # SLURM time limit. 0 disables the guard.
+  stop_margin_minutes: 5
+  # Full-size runs must be confirmed explicitly (HEART_CONFIRM_FULL=1).
+  requires_confirmation: false
+
+unicore:
+  # --- task / model / loss registered by ./unimol (LUMI names, unchanged) ---
+  task: unimol_contrastive
+  loss: unimol_contrastive
+  arch: unimol_contrastive_base
+  train-subset: train
+  valid-subset: valid
+  dict-name: dict.txt
+  mode: train
+  # --- data loading ---
+  num-workers: 5            # 6 CPUs allocated: 5 loader workers + main process
+  data-buffer-size: 10
+  # --- architecture: LUMI base (15 layers, 512 dim, 2048 FFN) with 64 heads ---
+  encoder-attention-heads: 64
+  # --- LUMI self-supervised objectives (method reference values) ---
+  masked-token-loss: 1
+  masked-coord-loss: 5
+  masked-dist-loss: 10
+  x-norm-loss: 0.01
+  delta-pair-repr-norm-loss: 0.01
+  contrastive-loss: 10.0
+  contrastive-view-mode: independent   # HEART patch P3; 'identical' = stock LUMI behaviour
+  mask-prob: 0.15
+  only-polar: 0             # 0 = remove all hydrogens (Uni-Mol/LUMI pretraining setting)
+  noise-type: uniform
+  noise: 1.0
+  max-atoms: 256
+  # --- optimisation (LUMI values except schedule length) ---
+  optimizer: adam
+  adam-betas: "(0.9, 0.99)"
+  adam-eps: 1.0e-6
+  clip-norm: 1.0
+  weight-decay: 1.0e-4
+  lr-scheduler: polynomial_decay
+  lr: 1.0e-5
+  warmup-updates: 3
+  # Schedule horizon longer than max-update so a resume test (e.g. to 12
+  # updates) still has a non-zero learning rate.
+  total-num-update: 20
+  update-freq: 1
+  seed: 1
+  batch-size: 4             # molecules per GPU; each contributes 2 views -> 8 sequences
+  batch-size-valid: 4
+  max-update: 10            # 10 genuine optimizer updates (fp16 overflow steps are not counted)
+  # --- precision: fp16 works on T4 (sm_75) and H200; bf16 is not native on T4 ---
+  fp16: true
+  fp16-init-scale: 4
+  fp16-scale-window: 256
+  # --- logging / validation / checkpoints ---
+  log-interval: 1
+  log-format: simple
+  validate-interval-updates: 5
+  max-valid-steps: 5        # bounded validation: at most 6 batches of valid.lmdb
+  save-interval-updates: 5
+  keep-interval-updates: 1
+  no-epoch-checkpoints: true
+  ddp-backend: c10d

@@ -1,0 +1,84 @@
+# HEART general molecular pretraining -- FULL RUN (prepared, NOT launched).
+#
+# Only run this after the pilot has passed on real data AND the batch-size
+# memory probe (README_HEART.md, Stage D) has been done on the target GPU.
+#
+# Submit from /home/ypan/heart_liver/model/pretrain, overriding the pilot's
+# SBATCH header on the command line (GRES type name: check `sinfo -o "%P %G"`):
+#   HEART_CONFIRM_FULL=1 sbatch --job-name=heart-pretrain-full \
+#       --time=2-00:00:00 --cpus-per-task=16 --mem=128G --gres=gpu:<h200-type>:1 \
+#       scripts/pretrain_heart.sh configs/full_pretrain.yaml
+#
+# run_dir_mode=fixed: every resubmission of this config reuses
+# <output_root>/<run_name> and resumes from checkpoint_last.pt automatically
+# (model, optimizer, LR schedule, fp16 scaler and data-iterator position).
+
+launcher:
+  run_name: heart-pretrain-full-v1
+  data_path: /home/ypan/heart_liver/model/UniMolReference/ligand_data/ligands
+  output_root: /home/ypan/heart_liver/model/heart_training_runs
+  n_gpu: 1                  # >1 uses torchrun (untested on CMRI; verify before use)
+  run_dir_mode: fixed
+  # Validate + write checkpoint_last.pt this long before the SLURM limit, so a
+  # resubmission loses no work. Keep it larger than one validation + save.
+  stop_margin_minutes: 20
+  # Refuse to start on a GPU with less memory than this (avoids burning a
+  # queue slot on a 15 GB T4 with an H200-sized batch).
+  min_gpu_mem_gb: 80
+  requires_confirmation: true
+
+unicore:
+  task: unimol_contrastive
+  loss: unimol_contrastive
+  arch: unimol_contrastive_base
+  train-subset: train
+  valid-subset: valid
+  dict-name: dict.txt
+  mode: train
+  # Capped by the launcher at (SLURM_CPUS_PER_TASK - 1).
+  num-workers: 15
+  data-buffer-size: 20
+  encoder-attention-heads: 64
+  # LUMI objectives and weights (unchanged)
+  masked-token-loss: 1
+  masked-coord-loss: 5
+  masked-dist-loss: 10
+  x-norm-loss: 0.01
+  delta-pair-repr-norm-loss: 0.01
+  contrastive-loss: 10.0
+  contrastive-view-mode: independent
+  mask-prob: 0.15
+  only-polar: 0
+  noise-type: uniform
+  noise: 1.0
+  max-atoms: 256
+  # LUMI optimisation schedule (method reference)
+  optimizer: adam
+  adam-betas: "(0.9, 0.99)"
+  adam-eps: 1.0e-6
+  clip-norm: 1.0
+  weight-decay: 1.0e-4
+  lr-scheduler: polynomial_decay
+  lr: 1.0e-5
+  warmup-updates: 10000
+  total-num-update: 1000000
+  max-update: 1000000
+  update-freq: 1
+  seed: 1
+  # LUMI used 448 molecules/GPU (x2 views) on an A100. Confirm with the memory
+  # probe; if it OOMs, use e.g. batch-size 224 + update-freq 2 (same number
+  # of molecules per update, but contrastive negatives come from each
+  # micro-batch only -- document the change).
+  batch-size: 448
+  batch-size-valid: 448
+  fp16: true                # on H200 `bf16: true` (and fp16: false) is an option; validate first
+  fp16-init-scale: 4
+  fp16-scale-window: 256
+  log-interval: 100
+  log-format: simple
+  validate-interval-updates: 10000
+  max-valid-steps: 250      # ~= all of valid.lmdb (98,844 / 448 = 221 batches)
+  save-interval-updates: 10000
+  keep-interval-updates: 10 # + checkpoint_last.pt + checkpoint_best.pt
+  no-epoch-checkpoints: true
+  ddp-backend: c10d

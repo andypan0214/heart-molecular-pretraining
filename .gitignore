@@ -1,0 +1,15 @@
+# local environments / caches
+.venv_heart_cpu/
+__pycache__/
+*.pyc
+.pytest_cache/
+# never commit data, checkpoints or run outputs
+*.lmdb
+*.lmdb-lock
+*.pt
+*.pth
+*.tar.gz
+logs/
+heart_training_runs/
+tsb/
+third_party/

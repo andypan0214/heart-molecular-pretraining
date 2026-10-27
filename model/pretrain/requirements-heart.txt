@@ -1,0 +1,16 @@
+# Python packages HEART pretraining needs inside the heart_gpu conda env
+# (/home/ypan/.conda/envs/heart_gpu). torch is NOT listed: keep the existing
+# torch 2.2.2+cu121 build and do not let pip replace it.
+#
+#   python -m pip install -r requirements-heart.txt
+#   then Uni-Core from source (see README_HEART.md, step 2):
+#   python -m pip install --no-build-isolation --no-deps <Uni-Core checkout @ ace6fae>
+numpy>=1.24,<2          # torch 2.2 wheels are built against NumPy 1.x
+lmdb>=1.4,<2
+rdkit==2024.9.6         # Add2DConformerDataset (2D view); version used in the CPU notebook
+scipy>=1.10,<1.14       # unimol.data.distance_dataset
+tokenizers<0.21         # imported unconditionally by unicore.data
+tensorboardX<3          # --tensorboard-logdir
+pyyaml>=6               # launcher configs
+tqdm
+pytest                  # optional: run pretrain/tests on HPC
