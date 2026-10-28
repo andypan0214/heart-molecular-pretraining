@@ -25,11 +25,14 @@
 #   RESUME_DIR=<run dir> MAX_UPDATE=12 sbatch --job-name=heart-smoke-resume scripts/pretrain_smoke.sh
 # T4 out of memory: resubmit with a documented smaller micro-batch (same model/losses):
 #   BATCH_SIZE=2 sbatch scripts/pretrain_smoke.sh        # then BATCH_SIZE=1
+# Host-RAM / DataLoader trouble (e.g. MemoryError in multiprocessing ForkingPickler):
+#   NUM_WORKERS=0 sbatch scripts/pretrain_smoke.sh       # load data in the main process
 # Pre-flight only (login node; prints the command, creates nothing):
 #   HEART_DRY_RUN=1 bash scripts/pretrain_smoke.sh
 #
 # Optional environment overrides:
-#   RESUME_DIR, MAX_UPDATE (10..20), BATCH_SIZE, HEART_DRY_RUN=1,
+#   RESUME_DIR, MAX_UPDATE (10..20), BATCH_SIZE, NUM_WORKERS (0..cpus-1, default 5),
+#   HEART_MEM_INTERVAL (memory sampling seconds, default 10; 0 = off), HEART_DRY_RUN=1,
 #   HEART_REPO / HEART_BASE / HEART_DATA_PATH / HEART_OUTPUT_ROOT / HEART_CONDA_ENV.
 # Local CPU testing hooks only: HEART_SKIP_ENV=1, HEART_PYTHON, HEART_TRAIN_ENTRY,
 #   HEART_LOCAL_CPU_TEST=1 (replaces fp16 by --cpu), HEART_EXTRA_ARGS="--flag v ..."
@@ -61,7 +64,7 @@ heart_runtime_env
 # >>> HEART smoke-test parameters (CMRI pilot values; LUMI objectives) >>>
 run_name=heart-smoke-test
 n_gpu=1
-num_workers=5                    # 6 CPUs: 5 DataLoader workers + main process
+num_workers="${NUM_WORKERS:-5}"  # 6 CPUs: 5 DataLoader workers + main process; 0 = low-memory mode
 lr=1e-5
 wd=1e-4
 batch_size="${BATCH_SIZE:-4}"    # molecules per GPU (x2 contrastive views); T4 OOM -> 2, then 1
@@ -105,9 +108,16 @@ if [ "${HEART_LOCAL_CPU_TEST:-0}" = "1" ]; then
 fi
 read -r -a extra_args <<< "${HEART_EXTRA_ARGS:-}"
 heart_reject_forbidden_args "${extra_args[@]}"
+case "$num_workers" in ''|*[!0-9]*) die "NUM_WORKERS must be a non-negative integer (got '$num_workers')" ;; esac
+num_workers=$(( 10#$num_workers ))
 if [ -n "${SLURM_CPUS_PER_TASK:-}" ] && [ "$num_workers" -ge "$SLURM_CPUS_PER_TASK" ]; then
+    [ -n "${NUM_WORKERS:-}" ] && die "NUM_WORKERS=$num_workers must be < SLURM_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK (one core for the main process)"
     num_workers=$(( SLURM_CPUS_PER_TASK > 1 ? SLURM_CPUS_PER_TASK - 1 : 0 ))
 fi
+[ "$num_workers" -le 64 ] || die "NUM_WORKERS=$num_workers is unreasonably large (max 64)"
+log "DataLoader workers: $num_workers$([ "$num_workers" = 0 ] && echo ' (low-memory mode: data loaded in the main process)')"
+mem_interval="${HEART_MEM_INTERVAL:-10}"
+case "$mem_interval" in ''|*[!0-9]*) die "HEART_MEM_INTERVAL must be a non-negative integer" ;; esac
 
 # >>> Pre-flight: real dataset, opened read-only >>>
 heart_check_data
@@ -170,9 +180,14 @@ fi
 heart_provenance "$save_dir" "$script_path" "${CMD[@]}"
 train_log="$save_dir/train-${SLURM_JOB_ID:-local}.log"
 log "training log: $train_log"
+heart_memory_limits
+mem_log="$save_dir/memory-${SLURM_JOB_ID:-local}.tsv"
+MEM_MON_PID=""
+[ "$mem_interval" != 0 ] && heart_mem_monitor_start "$mem_log" "$mem_interval"
 set +e
 "${CMD[@]}" 2>&1 | tee -a "$train_log"
 rc=${PIPESTATUS[0]}
+heart_mem_monitor_stop "$mem_log"
 
 # >>> Smoke-test verdict: losses, update count, checkpoint reload >>>
 echo "=== Summary ==="
@@ -196,6 +211,8 @@ verdict=PASS
     echo "max_update=$max_update"
     echo "resume_from=${resume_from:-none}"
     echo "batch_size=$batch_size"
+    echo "num_workers=$num_workers"
+    echo "peak_rss_total_mb=$MEM_PEAK_RSS_MB cgroup_peak_mb=$MEM_CGROUP_PEAK_MB"
     echo "train_exit=$rc summary_exit=$src checkpoint_exit=$vrc"
     echo "train_log=$train_log"
 } > "$save_dir/smoke_result-${SLURM_JOB_ID:-local}.txt"

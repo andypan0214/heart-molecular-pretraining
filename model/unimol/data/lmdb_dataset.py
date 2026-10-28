@@ -11,6 +11,14 @@
 #   statistics (O(1)) and verify that the numeric-key convention holds at the
 #   first and last index. Set HEART_LMDB_FULL_KEY_SCAN=1 to restore the
 #   upstream behaviour (useful for small fixtures or auditing).
+#
+# HEART patch P5 (fork safety): Uni-Core's trainer reads the first training
+#   batch in the main process (Trainer.get_train_iterator -> first_batch) before
+#   the DataLoader forks its workers, so the lazily opened environment was
+#   inherited by every worker. LMDB forbids using an environment across fork().
+#   The environment is now (re)opened per process (tracked by PID), dropped when
+#   the dataset is pickled (spawn/forkserver workers), and every read uses a
+#   short-lived transaction. Records, keys and ordering are unchanged.
 
 import lmdb
 import os
@@ -48,8 +56,7 @@ class LMDBDataset:
                                     "0..N-1".format(self.db_path, self._len, probe)
                                 )
         finally:
-            # Never carry an open environment into forked DataLoader workers;
-            # each worker reconnects lazily in __getitem__.
+            # Not kept: each process opens its own environment lazily (P5).
             env.close()
         logger.info("LMDBDataset {}: {} records".format(self.db_path, self._len))
 
@@ -71,11 +78,26 @@ class LMDBDataset:
     def __len__(self):
         return self._len
 
+    def __getstate__(self):
+        # never pickle an open environment (spawn/forkserver DataLoader workers)
+        state = self.__dict__.copy()
+        state.pop("env", None)
+        state.pop("_env_pid", None)
+        return state
+
+    def _get_env(self):
+        pid = os.getpid()
+        if getattr(self, "_env_pid", None) != pid:
+            # first use in this process, or an environment inherited through
+            # fork(): open our own; the inherited handle is not used again
+            self.connect_db(self.db_path, save_to_self=True)
+            self._env_pid = pid
+        return self.env
+
     @lru_cache(maxsize=16)
     def __getitem__(self, idx):
-        if not hasattr(self, "env"):
-            self.connect_db(self.db_path, save_to_self=True)
-        datapoint_pickled = self.env.begin().get(f"{idx}".encode("ascii"))
+        with self._get_env().begin() as txn:
+            datapoint_pickled = txn.get(f"{idx}".encode("ascii"))
         if datapoint_pickled is None:
             raise KeyError("{}: key b'{}' not found".format(self.db_path, idx))
         data = pickle.loads(datapoint_pickled)

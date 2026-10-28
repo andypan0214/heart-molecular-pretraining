@@ -1,5 +1,22 @@
 # HEART pretraining: implementation report
 
+## Update 2026-10-28 (b): DataLoader `MemoryError` in smoke job 1011484
+
+**Reported on CMRI.** Job 1011484 (T4, 6 CPUs, 55G, batch 4, 5 workers, fp16, real LMDB) reached `num_updates=1` with a finite loss of about 27.467. It then stalled for more than 11 minutes on repeated `MemoryError` in `multiprocessing/queues.py` / `ForkingPickler.dumps`. `sacct` recorded no RAM usage, so the cause is **not proven**.
+
+**Investigation (local, by code reading and measurement):**
+
+* Per-item data code: every Uni-Mol wrapper has `lru_cache(maxsize=16)`. P1 avoids a key list. Nothing materialises the dataset. A collated batch-4 batch pickles to about 1 KB through `ForkingPickler`, because tensors go through shared memory, so no single batch is oversized.
+* Uni-Core builds about 4.7M index arrays per epoch for 18.8M molecules at batch 4 (`batch_by_size`, `frozen_batches`, list copies), roughly 1 GB in the main process. Workers are forked from a process that already holds the CUDA context and the model.
+* **Defect found and fixed (P5).** `Trainer.get_train_iterator` reads `first_batch` in the main process before the DataLoader forks, so `LMDBDataset` opened its environment there and every worker inherited it. LMDB forbids use across `fork()`. The environment is now opened per process (PID-tracked), never pickled, and read with short transactions. Records and order are unchanged.
+* Remaining candidates, which need CMRI evidence: host RAM growth across 6 processes; `/dev/shm` capacity; a per-process virtual-memory limit (each worker maps the ~150 GB LMDB, plus inherited CUDA mappings); or a combination. It is also possible that P5 alone resolves it, but that is unverified.
+
+**Changes:** `NUM_WORKERS` for `pretrain_smoke.sh` (default 5; `0` = low-memory mode; validated as an integer with 0 ≤ n < `SLURM_CPUS_PER_TASK` and n ≤ 64); memory limits printed at job start; a background sampler writing `memory-<job>.tsv` (RSS, VSZ, cgroup, `/dev/shm`, MemAvailable); peaks recorded in `smoke_result-<job>.txt`. The same diagnostics were added to `pretrain_heart.sh`. Notebook F1 now has `NUM_WORKERS_OVERRIDE`, G4 detects `MemoryError`/`ForkingPickler`, and a new G4b reviews memory. README_HEART §8 covers troubleshooting. Batch size, model, losses and the 10-update, validation, checkpoint and resume workflow are unchanged.
+
+**Local tests:** `pytest pretrain/tests`: **114 passed, 1 skipped, 0 failed** (synthetic fixture, Windows CPU). New tests: `test_lmdb_workers.py`, with 3 tests that fail on the pre-P5 code and pass now, plus a real spawn-worker read after a main-process read. The fork-based full-pipeline worker test is **skipped on Windows** and runs on Linux. `test_scripts.py` gains 15 tests: `NUM_WORKERS` 0/2/5/default reaches `--num-workers` exactly once with unchanged scientific flags; −1, `abc`, `1.5`, injection, ≥ CPUs and > 64 are rejected; an end-to-end smoke run with `NUM_WORKERS=0` through the real `unicore-train` CLI; full-script `NUM_WORKERS`; the memory-summary parser. The live sampler (`ps`, cgroup, `/dev/shm`) is Linux-only and was **not executed** locally.
+
+**Not run:** the resubmitted GPU smoke job on CMRI. No GPU result is claimed.
+
 ## Update 2026-10-28: model_train paths, two LUMI-style scripts, heart_gpu repair, HPC notebook
 
 Scope is unchanged: LUMI-lab's original general pretraining stage, random initialisation, Uni-Mol ligand data, Uni-Core trainer. **No model has been pretrained, and no HPC/GPU step has been run.**

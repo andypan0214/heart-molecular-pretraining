@@ -397,3 +397,91 @@ def test_check_env_fix_refuses_to_install_over_blockers(fixture_dir, tmp_path):
         assert "refusing to install into this environment" in p.stdout
     assert not [l for l in p.stdout.splitlines() if l.startswith("+ ")]  # no pip / Uni-Core install ran
     assert list((tmp_path / "runs" / "env").glob("check_heart_env-fix-*.log"))
+
+
+# --------------------------------------------------------------------------- NUM_WORKERS (job 1011484)
+def _flag(cmd, flag):
+    from check_resume_args import command_values
+
+    return command_values(cmd)[flag.lstrip("-")]
+
+
+@needs_bash
+@pytest.mark.parametrize("value,expected", [(None, "5"), ("0", "0"), ("2", "2"), ("5", "5")])
+def test_smoke_num_workers_reaches_unicore_command(fixture_dir, tmp_path, value, expected):
+    extra = {"HEART_DRY_RUN": 1, "SLURM_CPUS_PER_TASK": 6}
+    if value is not None:
+        extra["NUM_WORKERS"] = value
+    p = run_script("pretrain_smoke.sh", base_env(fixture_dir, tmp_path, **extra))
+    assert p.returncode == 0, p.stderr[-2000:]
+    cmd = printed_command(p.stdout)
+    assert _flag(cmd, "--num-workers") == expected
+    assert cmd.count("--num-workers") == 1
+    assert ("low-memory mode" in p.stdout) == (expected == "0")
+    # scientific settings untouched by the worker count
+    assert _flag(cmd, "--batch-size") == "4" and _flag(cmd, "--max-update") == "10"
+    assert _flag(cmd, "--encoder-attention-heads") == "64" and _flag(cmd, "--contrastive-loss") == "10.0"
+
+
+@needs_bash
+@pytest.mark.parametrize("value,msg", [
+    ("-1", "NUM_WORKERS must be a non-negative integer"),
+    ("abc", "NUM_WORKERS must be a non-negative integer"),
+    ("1.5", "NUM_WORKERS must be a non-negative integer"),
+    ("0 --restore-file x", "NUM_WORKERS must be a non-negative integer"),
+    ("6", "must be < SLURM_CPUS_PER_TASK=6"),
+    ("65", "unreasonably large"),
+])
+def test_smoke_rejects_invalid_num_workers(fixture_dir, tmp_path, value, msg):
+    extra = {"HEART_DRY_RUN": 1, "NUM_WORKERS": value}
+    if value == "6":
+        extra["SLURM_CPUS_PER_TASK"] = 6
+    p = run_script("pretrain_smoke.sh", base_env(fixture_dir, tmp_path, **extra))
+    assert p.returncode != 0 and msg in p.stderr, p.stderr[-2000:]
+
+
+@needs_bash
+def test_smoke_trains_with_num_workers_0(fixture_dir, tmp_path):
+    """NUM_WORKERS=0 through the real unicore-train CLI (no --num-workers in HEART_EXTRA_ARGS)."""
+    tiny_no_workers = TINY.replace("--num-workers 0 ", "")
+    assert "--num-workers" not in tiny_no_workers
+    env = cpu_env(fixture_dir, tmp_path, MAX_UPDATE=2, NUM_WORKERS=0)
+    env["HEART_EXTRA_ARGS"] = tiny_no_workers
+    p = run_script("pretrain_smoke.sh", env)
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    assert "num_workers=0" in p.stdout                      # Uni-Core Namespace
+    assert "PASS  reached 2 optimizer updates" in p.stdout and "PASS  num_updates == 2" in p.stdout
+    (run_dir,) = list((tmp_path / "smoke").iterdir())
+    result = (run_dir / "smoke_result-local.txt").read_text()
+    assert "verdict=PASS" in result and "num_workers=0" in result and "peak_rss_total_mb=" in result
+    assert "=== CPU memory limits ===" in p.stdout
+
+
+@needs_bash
+@pytest.mark.parametrize("value,ok", [("0", True), ("-1", False), ("x", False)])
+def test_full_num_workers(fixture_dir, tmp_path, value, ok):
+    smoke = fake_smoke_evidence(tmp_path / "smoke")
+    p = run_script("pretrain_heart.sh", base_env(fixture_dir, tmp_path / "runs", HEART_CONFIRM_FULL=1, BATCH_SIZE=448,
+                                                 NUM_WORKERS=value, MIN_FREE_GB=0, HEART_SMOKE_RUN=_posix(smoke),
+                                                 HEART_DRY_RUN=1))
+    if ok:
+        assert p.returncode == 0, p.stderr[-2000:]
+        assert _flag(printed_command(p.stdout), "--num-workers") == "0"
+    else:
+        assert p.returncode != 0 and "num_workers must be a non-negative integer" in p.stderr
+
+
+@needs_bash
+def test_memory_summary_parses_sampler_tsv(tmp_path):
+    tsv = tmp_path / "memory-1.tsv"
+    tsv.write_text(
+        "time\tprocs\trss_total_mb\trss_max_proc_mb\tvsz_max_proc_mb\tcgroup_mb\tshm_used_mb\tmem_available_mb\n"
+        "2026-10-28 10:00:00\t7\t9000\t4000\t180000\t9500\t120\t200000\n"
+        "2026-10-28 10:00:10\t8\t52000\t9000\t190000\t54000\t31000\t1000\n"
+        "2026-10-28 10:00:20\t2\t3000\t3000\t30000\t3100\t0\t250000\n", encoding="utf-8")
+    script = ('. "{}"; MEM_MON_PID=""; heart_mem_monitor_stop "{}"; echo "PEAK=$MEM_PEAK_RSS_MB"'
+              .format(_posix(os.path.join(SCRIPTS_DIR, "heart_lib.sh")), _posix(tsv)))
+    p = subprocess.run([BASH, "-c", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert "peak total RSS 52000 MB | peak single-process RSS 9000 MB | peak VSZ 190000 MB" in p.stdout
+    assert "peak /dev/shm used 31000 MB | max processes 8" in p.stdout and "PEAK=52000" in p.stdout

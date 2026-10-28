@@ -2,7 +2,7 @@
 
 | Path | Origin | Upstream commit | License | HEART changes |
 |---|---|---|---|---|
-| `data/*.py` | [Uni-Mol](https://github.com/deepmodeling/Uni-Mol) `unimol/unimol/data/` | `90f52c4` | MIT (`LICENSE.Uni-Mol`) | `lmdb_dataset.py` (P1), `add_2d_conformer_dataset.py` (P2); the rest is verbatim |
+| `data/*.py` | [Uni-Mol](https://github.com/deepmodeling/Uni-Mol) `unimol/unimol/data/` | `90f52c4` | MIT (`LICENSE.Uni-Mol`) | `lmdb_dataset.py` (P1, P5), `add_2d_conformer_dataset.py` (P2); the rest is verbatim |
 | `tasks/unimol_contrastive.py` | [LUMI-lab](https://github.com/bowenli-lab/LUMI-lab) `model/unimol/tasks/` | `611e02b` | GPL-3.0 (`LICENSE.LUMI-lab`); the file header keeps the original DP Technology MIT notice | P3 (view mode, shared 2D-conformer reader) |
 | `tasks/__init__.py`, `losses/__init__.py` | LUMI-lab | `611e02b` | GPL-3.0 | verbatim |
 | `models/unimol_contrastive.py` | LUMI-lab | `611e02b` | GPL-3.0 | P4 (padding-mask guard) |

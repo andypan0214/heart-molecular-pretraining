@@ -122,7 +122,7 @@ cat "$RUN/smoke_result-$JOBID.txt"
 cd /home/ypan/heart_liver/model_train/heart-molecular-pretraining/model
 python pretrain/tools/summarize_log.py "$RUN/train-$JOBID.log" --expect-updates 10
 python pretrain/tools/verify_checkpoint.py "$RUN/checkpoint_last.pt" --expect-updates 10
-grep -E "CUDA out of memory|Traceback|DataLoader worker" "$LOG/heart-smoke-test-$JOBID".{out,err}   # expect no output
+grep -E "CUDA out of memory|Traceback|DataLoader worker [(]pid" "$LOG/heart-smoke-test-$JOBID".{out,err}   # expect no output
 ```
 
 Expected: 10 `train_inner` rows with loss, masked_token_loss, masked_coord_loss, masked_dist_loss, contrastive_loss, x_norm_loss and delta_pair_repr_norm_loss. There should be validation rows at updates 5 and 10, `num_updates == 10` in `checkpoint_last.pt`, a strict model rebuild, and every line PASS. fp16 overflow steps are skipped by Uni-Core and do not count as updates. `gb_free` is the remaining GPU memory.
@@ -138,6 +138,8 @@ grep "Loaded checkpoint" "$RUN/train-$RJOB.log"      # ... (epoch 1 @ 10 updates
 ```
 
 **If the T4 runs out of memory**, resubmit with a smaller micro-batch and record the change: `BATCH_SIZE=2 sbatch scripts/pretrain_smoke.sh`, then `BATCH_SIZE=1`. The model, objectives and loss weights stay the same.
+
+**If host (CPU) memory or the DataLoader fails**, for example with `MemoryError` in `multiprocessing` / `ForkingPickler`, use the low-memory mode `NUM_WORKERS=0 sbatch scripts/pretrain_smoke.sh`. The default is 5 workers, and values must be between 0 and CPUs−1. See section 8.
 
 ## 5. Full pretraining: a separate decision, never automatic
 
@@ -190,3 +192,63 @@ The tests use a synthetic 8-SMILES fixture and a tiny 2-layer CPU model. They ru
 * **Contrastive views.** `--contrastive-view-mode independent` is the HEART default, used in both scripts. The two views of a molecule get independently sampled conformers, masks and coordinate noise. With the stock Uni-Mol data modules, LUMI's code produces **identical** views that differ only by dropout. `identical` reproduces that exactly. See `IMPLEMENTATION_MAP.md` §6.
 * **Expected warnings.** `fused_* is not installed corrected` is expected: Uni-Core's CUDA extensions are not compiled, and PyTorch fallbacks are used.
 * **Configs.** `configs/pilot.yaml` and `configs/full_pretrain.yaml` are machine-readable records of the two scripts' parameter blocks. The scripts do not read them. `tests/test_scripts.py` fails if a script and its record disagree. The notebook builds its Part C/E arguments from `pilot.yaml`.
+
+## 8. Troubleshooting: `MemoryError` in `multiprocessing` / `ForkingPickler.dumps` (smoke job 1011484)
+
+**Symptom.** The job reaches `num_updates=1` with a finite loss, then logs repeated tracebacks like the following and makes no further progress until the time limit:
+
+```text
+MemoryError
+  ... multiprocessing/queues.py ... _feed
+  ... multiprocessing/reduction.py ... ForkingPickler.dumps(obj)
+```
+
+**What it means.** A DataLoader process failed to allocate memory while serializing a batch, or an index list, for the queue between the workers and the main process. That item is then lost. Uni-Core's DataLoader has no timeout, so the main process waits for it indefinitely, and the job looks stalled. The batch itself is small: about 1 KB of handles, with the tensors passed through `/dev/shm` (measured locally for batch size 4). The failure is therefore an allocation limit or exhaustion in that process or node, not one oversized batch.
+
+**Possible causes. None is proven for job 1011484, because `sacct` recorded no RAM figures:**
+
+1. **Host RAM growth across 6 processes.** The 5 workers are forked from a main process that already holds the CUDA context, the model and Uni-Core's per-epoch batch list (about 4.7M index arrays for 18.8M molecules at batch 4, roughly 1 GB). Copy-on-write and per-worker caches add to that.
+2. **`/dev/shm` full or small.** Worker tensors travel through shared memory.
+3. **A per-process virtual-memory limit** (`ulimit -v`, SLURM `VSizeFactor`). Each worker maps the ~150 GB `train.lmdb` read-only, which counts as virtual size, on top of the CUDA mappings inherited from the main process.
+4. **An LMDB environment inherited across `fork()`.** This was a confirmed code defect and is now fixed as patch P5. Uni-Core reads the first batch in the main process, which opened the LMDB environment there, and all workers inherited it. LMDB forbids that. Each process now opens its own environment. It is not certain that this caused the `MemoryError`.
+
+**What to do.**
+
+```bash
+cd /home/ypan/heart_liver/model_train/heart-molecular-pretraining
+git pull --ff-only                                   # includes P5 + memory diagnostics
+cd model/pretrain
+NUM_WORKERS=0 HEART_DRY_RUN=1 bash scripts/pretrain_smoke.sh | grep -E "DataLoader workers|num-workers"
+JOBID=$(NUM_WORKERS=0 sbatch --parsable scripts/pretrain_smoke.sh); echo $JOBID
+```
+
+`NUM_WORKERS=0` loads and collates data in the training process itself, using a background buffer thread, with no worker processes or inter-process queue. The batch size (4), model, losses and the 10-update, validation, checkpoint and resume workflow are unchanged. This is a **diagnostic, low-memory mode**. It removes the multiprocessing path; it does not by itself explain the underlying problem. Data loading becomes slower, which is fine for 10 updates but would starve the GPU in full training.
+
+**Evidence each job now records:**
+
+* At start, in the SLURM `.out`: `ulimit -v/-m/-n`, MemTotal/MemAvailable, the cgroup memory limit, `/dev/shm` size, and the DataLoader worker count.
+* `$RUN/memory-<jobid>.tsv`: every 10 s, the number of processes, total and maximum per-process RSS, maximum VSZ, cgroup usage, `/dev/shm` used and MemAvailable. Change the interval with `HEART_MEM_INTERVAL`; `0` turns sampling off.
+* At the end: peak RSS, VSZ and `/dev/shm`, the cgroup peak, and `num_workers` and `peak_rss_total_mb` in `smoke_result-<jobid>.txt`.
+
+```bash
+LOG=/home/ypan/heart_liver/model_train/heart-molecular-pretraining/runs/slurm
+grep -A6 "=== CPU memory limits ===" $LOG/heart-smoke-test-$JOBID.out
+sstat -j $JOBID.batch --format=JobID,MaxRSS,MaxVMSize,AveRSS       # while running
+sacct -j $JOBID --format=JobID,State,Elapsed,MaxRSS,MaxVMSize,ReqMem,ExitCode
+seff $JOBID 2>/dev/null                                           # if installed
+RUN=$(grep -o 'run dir: .*' $LOG/heart-smoke-test-$JOBID.out | tail -1 | cut -d' ' -f3)
+column -t $RUN/memory-$JOBID.tsv | tail -20
+grep -A2 "=== CPU memory (sampled" $LOG/heart-smoke-test-$JOBID.out
+grep -E "MemoryError|ForkingPickler|DataLoader worker [(]pid|Killed" $LOG/heart-smoke-test-$JOBID.{out,err}   # expect nothing
+```
+
+How to read the result:
+
+| Outcome | Interpretation | Next step |
+|---|---|---|
+| `NUM_WORKERS=0` passes and RSS stays far below 55G | the multiprocessing path was involved (memory, shm, VSZ limit or the fixed LMDB inheritance) | resubmit with `NUM_WORKERS=2`, then 5, comparing `memory-<job>.tsv`. Use the largest count that passes, which matters for full training |
+| `NUM_WORKERS=0` passes, but VSZ is near `ulimit -v` | virtual-memory limit | ask CMRI support about `VSizeFactor` / `ulimit -v`, and quote the TSV |
+| a run with workers fails while `/dev/shm` used approaches its size | shared memory | ask for a larger `/dev/shm`, or use fewer workers |
+| `NUM_WORKERS=0` also shows a `MemoryError` or a cgroup peak near 55G | main-process memory | send the `.out`, `.err` and TSV for analysis. Do not raise `--mem` blindly |
+
+Nothing here changes the scientific settings. If you do change `--mem`, `NUM_WORKERS` or `BATCH_SIZE` for a run, record it next to the results; `smoke_result-<jobid>.txt` already stores the latter two.

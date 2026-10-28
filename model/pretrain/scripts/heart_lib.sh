@@ -234,6 +234,84 @@ heart_stop_time_args() {
     fi
 }
 
+# --- CPU memory diagnostics (Linux only; sacct MaxRSS is not always recorded) ---
+# Prints the memory file of this job's cgroup: $1 = current | peak | max
+heart_cgroup_mem_file() {
+    local cg d
+    [ -r /proc/self/cgroup ] || return 0
+    cg="$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)"
+    d="/sys/fs/cgroup$cg"
+    if [ -n "$cg" ] && [ -r "$d/memory.current" ]; then         # cgroup v2
+        case "$1" in current) echo "$d/memory.current" ;; peak) echo "$d/memory.peak" ;; max) echo "$d/memory.max" ;; esac
+        return 0
+    fi
+    cg="$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3}' /proc/self/cgroup)"
+    d="/sys/fs/cgroup/memory$cg"
+    if [ -n "$cg" ] && [ -r "$d/memory.usage_in_bytes" ]; then  # cgroup v1
+        case "$1" in current) echo "$d/memory.usage_in_bytes" ;; peak) echo "$d/memory.max_usage_in_bytes" ;; max) echo "$d/memory.limit_in_bytes" ;; esac
+    fi
+}
+
+# Limits that can turn an allocation into a Python MemoryError.
+heart_memory_limits() {
+    local f
+    echo "=== CPU memory limits ==="
+    echo "ulimit -v (virtual, KiB): $(ulimit -v)  | ulimit -m: $(ulimit -m)  | ulimit -n (fds): $(ulimit -n)"
+    [ -r /proc/meminfo ] && grep -E '^(MemTotal|MemAvailable)' /proc/meminfo | tr -s ' ' | tr '\n' ' ' && echo
+    f="$(heart_cgroup_mem_file max)"
+    [ -n "$f" ] && [ -r "$f" ] && echo "cgroup memory limit: $(cat "$f") ($f)"
+    df -h /dev/shm 2>/dev/null | tail -1 | awk '{print "/dev/shm: size " $2 ", used " $3 ", free " $4}'
+    echo "SLURM_MEM_PER_NODE=${SLURM_MEM_PER_NODE:-} SLURM_MEM_PER_CPU=${SLURM_MEM_PER_CPU:-}"
+}
+
+# Background sampler: $1 = TSV file, $2 = interval seconds. Sets MEM_MON_PID.
+# Columns: total/max RSS and max VSZ over this job's processes (session),
+# cgroup usage, /dev/shm used (DataLoader workers pass tensors through it).
+heart_mem_monitor_start() {
+    local out="$1" interval="${2:-10}" sid cgf
+    MEM_MON_PID=""
+    if [ "$(uname -s)" != "Linux" ] || ! ps -o sid= -p $$ >/dev/null 2>&1; then
+        log "memory monitor: needs Linux procps; skipped"
+        return 0
+    fi
+    sid="$(ps -o sid= -p $$ | tr -d ' ')"
+    cgf="$(heart_cgroup_mem_file current)"
+    printf 'time\tprocs\trss_total_mb\trss_max_proc_mb\tvsz_max_proc_mb\tcgroup_mb\tshm_used_mb\tmem_available_mb\n' > "$out"
+    (
+        while :; do
+            stats="$(ps -s "$sid" -o rss=,vsz= 2>/dev/null | awk '{n++; s+=$1; if ($1>m) m=$1; if ($2>v) v=$2}
+                END {printf "%d\t%.0f\t%.0f\t%.0f", n, s/1024, m/1024, v/1024}')"
+            cgm=NA; [ -n "$cgf" ] && [ -r "$cgf" ] && cgm=$(( $(cat "$cgf") / 1048576 ))
+            shm="$(df -Pm /dev/shm 2>/dev/null | awk 'NR==2 {print $3}')"
+            avail="$(awk '/^MemAvailable/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null)"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$stats" "$cgm" "${shm:-NA}" "${avail:-NA}" >> "$out"
+            sleep "$interval"
+        done
+    ) &
+    MEM_MON_PID=$!
+    log "memory monitor: every ${interval}s -> $out (pid $MEM_MON_PID)"
+}
+
+# Stops the sampler and prints peaks; sets MEM_PEAK_RSS_MB and MEM_CGROUP_PEAK_MB.
+heart_mem_monitor_stop() {
+    local out="$1" f
+    MEM_PEAK_RSS_MB=NA
+    MEM_CGROUP_PEAK_MB=NA
+    [ -n "${MEM_MON_PID:-}" ] && kill "$MEM_MON_PID" 2>/dev/null && wait "$MEM_MON_PID" 2>/dev/null
+    if [ -s "$out" ]; then
+        MEM_PEAK_RSS_MB="$(awk -F'\t' 'NR>1 && $3>m {m=$3} END {print m+0}' "$out")"
+        echo "=== CPU memory (sampled, $out) ==="
+        awk -F'\t' 'NR>1 {if ($3>r) r=$3; if ($4>p) p=$4; if ($5>v) v=$5; if ($7>s) s=$7; if ($2>n) n=$2}
+            END {printf "peak total RSS %d MB | peak single-process RSS %d MB | peak VSZ %d MB | peak /dev/shm used %d MB | max processes %d\n", r, p, v, s, n}' "$out"
+    fi
+    f="$(heart_cgroup_mem_file peak)"
+    if [ -n "$f" ] && [ -r "$f" ]; then
+        MEM_CGROUP_PEAK_MB=$(( $(cat "$f") / 1048576 ))
+        echo "cgroup peak memory: ${MEM_CGROUP_PEAK_MB} MB ($f)"
+    fi
+    return 0
+}
+
 # $1 = run dir, $2 = script path, remaining = command. Small text files only.
 heart_provenance() {
     local save_dir="$1" script="$2" prov

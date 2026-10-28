@@ -38,7 +38,8 @@
 # Pre-flight only, on the login node (no training, nothing created):
 #   HEART_DRY_RUN=1 HEART_CONFIRM_FULL=1 BATCH_SIZE=... HEART_SMOKE_RUN=... bash scripts/pretrain_heart.sh
 #
-# Optional overrides: RUN_NAME, UPDATE_FREQ, NUM_WORKERS, MIN_GPU_MEM_GB (40),
+# Optional overrides: RUN_NAME, UPDATE_FREQ, NUM_WORKERS (0 = load data in the main process),
+#   HEART_MEM_INTERVAL (memory sampling seconds, default 60; 0 = off), MIN_GPU_MEM_GB (40),
 #   MIN_FREE_GB (50), STOP_MARGIN_MINUTES (30), N_GPU (1; >1 uses torchrun, untested),
 #   HEART_ALLOW_ARG_CHANGE=1 (resume despite changed settings), plus the
 #   HEART_* path variables of heart_lib.sh. Local CPU testing hooks as in
@@ -231,6 +232,10 @@ on_signal() {
         kill -TERM "$train_pid" 2>/dev/null || true
     fi
 }
+heart_memory_limits
+mem_log="$save_dir/memory-${SLURM_JOB_ID:-local}.tsv"
+MEM_MON_PID=""
+[ "${HEART_MEM_INTERVAL:-60}" != 0 ] && heart_mem_monitor_start "$mem_log" "${HEART_MEM_INTERVAL:-60}"
 trap 'on_signal USR1' USR1
 trap 'on_signal TERM' TERM
 set +e
@@ -244,6 +249,7 @@ while :; do
     kill -0 "$train_pid" 2>/dev/null || break
 done
 trap - USR1 TERM
+heart_mem_monitor_stop "$mem_log"
 
 echo "=== Summary ==="
 "$PY" "$PRETRAIN_DIR/tools/summarize_log.py" "$train_log" || log "summary reported FAIL items (see above)"
