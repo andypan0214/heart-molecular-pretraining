@@ -2,7 +2,7 @@
 """Verify a Uni-Core checkpoint written by HEART pretraining and reload it.
 
 Run from the model root (so ./unimol is importable):
-    cd /home/ypan/heart_liver/model
+    cd /home/ypan/heart_liver/model_train/heart-molecular-pretraining/model
     python pretrain/tools/verify_checkpoint.py <save_dir>/checkpoint_last.pt [--expect-updates 10]
 
 Checks: required Uni-Core keys, update counter, finite weights, random-init

@@ -2,7 +2,7 @@
 """Verify that Uni-Core discovers the HEART/LUMI registrations via --user-dir.
 
 Run from the model root (the directory that contains `unimol/` and `pretrain/`):
-    cd /home/ypan/heart_liver/model
+    cd /home/ypan/heart_liver/model_train/heart-molecular-pretraining/model
     python pretrain/tools/check_registry.py --user-dir ./unimol
 
 Exit code 0 only if the task, model, architecture and loss are registered and

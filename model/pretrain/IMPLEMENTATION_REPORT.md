@@ -1,8 +1,51 @@
-# HEART pretraining: implementation report (2026-10-27)
+# HEART pretraining: implementation report
+
+## Update 2026-10-28: model_train paths, two LUMI-style scripts, heart_gpu repair, HPC notebook
+
+Scope is unchanged: LUMI-lab's original general pretraining stage, random initialisation, Uni-Mol ligand data, Uni-Core trainer. **No model has been pretrained, and no HPC/GPU step has been run.**
+
+### Changes
+
+| Item | Where |
+|---|---|
+| Fixed CMRI layout `/home/ypan/heart_liver/model_train/{heart-molecular-pretraining,third_party/Uni-Core,UniMolReference}`; paths derived from the script location (`scontrol` under sbatch) with `HEART_*` overrides; the old `/home/ypan/heart_liver/model/` root is gone from every script, config, tool and notebook | `scripts/heart_lib.sh`, all docs |
+| `scripts/pretrain_smoke.sh` (new): 30 min / 1 GPU / 6 CPU / 55G; real train/valid LMDB; 10 fp16 updates; validation and checkpoints at 5/10; post-run log + checkpoint verification → `smoke_result-<job>.txt`; `RESUME_DIR` + `MAX_UPDATE` resume test; `BATCH_SIZE` override for T4 OOM | `scripts/` |
+| `scripts/pretrain_heart.sh` (rewritten): full LUMI schedule; gates (`HEART_CONFIRM_FULL=1`, explicit `BATCH_SIZE`, passed smoke evidence, sbatch-only, GPU memory, disk, time limit); fixed resumable run directory; refusal of changed settings on resume; clean stop before the limit; USR1/TERM handling; effective-batch reporting | `scripts/`, `tools/check_resume_args.py` |
+| Both scripts: LUMI-style parameter block + one explicit `unicore-train` command (no YAML indirection). The YAML files are now parameter records, checked flag by flag against the scripts | `configs/`, `tests/test_scripts.py` |
+| `scripts/check_heart_env.sh`: check-only default; `--fix` installs only missing/incompatible packages into `heart_gpu` (env python, `PIP_USER=0`, torch/numpy constraints) and reinstalls Uni-Core from the existing `third_party/Uni-Core` @ `ace6fae`; Jupyter kernel; `runs/slurm`; logs; blockers never "fixed" | `scripts/`, `tools/heart_env_check.py`, `requirements-heart.txt` |
+| `notebooks/HEART_HPC_Validation.ipynb`: 49 cells (38 code), Parts A–G with PASS/FAIL bookkeeping, guarded `sbatch`, evidence-only verdict, separate full-training gate | `notebooks/` |
+| `runs/` git-ignored, except the tracked empty `runs/slurm/` so SLURM log paths exist before the first `sbatch` | `.gitignore` |
+| HEART vs LUMI scientific comparison (task/model/loss), independent vs identical views, batch semantics | `IMPLEMENTATION_MAP.md` §6 |
+
+`model/unimol/` is **unchanged** in this update (only a path comment in `__init__.py`). P1–P4 and the registration names are as before.
+
+### Locally tested (Windows 11, Git Bash, Python 3.11.7, torch 2.2.2+cpu, Uni-Core `ace6fae` on PYTHONPATH)
+
+`python -m pytest pretrain/tests -v`: **95 passed, 0 failed, 0 skipped** (118 s).
+
+| File | Tests | Covers |
+|---|---|---|
+| `test_data_pipeline.py`, `test_model_loss.py`, `test_registry.py`, `test_fixture_data.py`, `test_inspect_lmdb.py`, `test_unicore_train_e2e.py` | 34 | unchanged from 2026-10-27 (pipeline, patches, views, model/loss, registry, real `unicore-train` CLI and resume) |
+| `test_launcher.py` | 7 | YAML records: CMRI pilot values, LUMI weights, model_train paths, forbidden keys, overrides |
+| `test_scripts.py` | 37 | `bash -n` + LF for all 4 scripts; exact smoke SBATCH directives; full directives; no LUMI-author settings or pip in training scripts; LUMI-style parameter block; smoke never launches full; no obsolete root in scripts/configs/tools/notebook; `.gitignore`; **smoke dry-run command == `pilot.yaml`** and **full dry-run command == `full_pretrain.yaml`** flag by flag; bad overrides rejected; missing data; output inside data; **smoke run (2 updates) → verify → verdict → resume to 4 → refusal at 4**; full refusals (confirmation, batch, smoke evidence, non-PASS / < 10-update evidence, outside sbatch) with nothing created; accumulation reporting; **full run 2 updates → resume to 3 → refuses changed batch size**; `check_heart_env.sh` help, bad argument, check mode creates nothing, `--fix` refuses to install over blockers |
+| `test_env_tools.py` | 11 | requirements parsing and pins, version ranges, prefix containment, git HEAD (detached/branch/packed), foreign interpreter → BLOCK with no torch repair, resume-argument parsing |
+| `test_notebook.py` | 6 | nbformat 4, `heart_gpu` kernel, unique ids, every code cell compiles; ≥ 30 short labelled cells, Parts A–G; no magics/pip, submit guards off, never submits full training, read-only LMDB; **Parts 0–E executed on the fixture** (real 48,144,227-parameter model, 2D conformer, independent views, padding, forward/backward finite); **Part G executed on a real local 10-update smoke run** (G1–G4 PASS); Part G without a job records nothing |
+
+The previous 48 tests: the 34 unchanged tests still pass. The 14 tests of the old single launcher (`test_launcher.py`) were ported to the new scripts with the same assertions or stricter ones (`test_launcher.py` + `test_scripts.py`). None were deleted to obtain a PASS.
+
+Locally, `check_heart_env.sh` and notebook Part B correctly report the dev venv as **not** `heart_gpu`-compatible: `torch 2.2.2+cpu` is a BLOCK, there is no `ipykernel`, and Uni-Core is on PYTHONPATH rather than installed. These are expected local FAILs, not HPC results.
+
+### Not run (requires CMRI; only you can run these)
+
+`check_heart_env.sh --fix` / check on CMRI and on a GPU node; notebook Parts A–E on the real LMDB and kernel; `sbatch scripts/pretrain_smoke.sh` (fp16, T4, real data, 10 updates); the resume job to 12; the H200 VRAM probe; any full run. `shellcheck` was not available locally. The SLURM-only code paths (`scontrol` script path recovery, `squeue` time-left → `--stop-time-hours`, `--signal` trap, `sacct` polling in the notebook) are therefore untested.
+
+---
+
+## 2026-10-27 (previous delivery)
 
 Scope: LUMI-lab's original **general molecular pretraining** stage. Random initialisation, Uni-Mol ligand data, Uni-Core trainer. No continual pretraining, fine-tuning or lipid-specific prediction. **No model has been pretrained.** Every training run in this report was a few updates on 8 synthetic molecules on a CPU.
 
-## 1. Implemented
+### 1. Implemented
 
 | Item | Where |
 |---|---|
@@ -17,7 +60,7 @@ Scope: LUMI-lab's original **general molecular pretraining** stage. Random initi
 | 48 CPU tests | `tests/` |
 | Licences and attributions (LUMI GPL-3.0, Uni-Mol/Uni-Core MIT) | `model/unimol/THIRD_PARTY_NOTICES.md`, `LICENSE.*` |
 
-## 2. Locally tested (Windows 11, Python 3.11.7, torch 2.2.2+cpu, RDKit 2024.09.6, NumPy 1.26.4, Uni-Core `ace6fae` from source)
+### 2. Locally tested (Windows 11, Python 3.11.7, torch 2.2.2+cpu, RDKit 2024.09.6, NumPy 1.26.4, Uni-Core `ace6fae` from source)
 
 `python -m pytest pretrain/tests`: **48 passed, 0 failed.**
 
@@ -47,7 +90,7 @@ Scope: LUMI-lab's original **general molecular pretraining** stage. Random initi
 
 Not run locally: GPU, fp16, CUDA, multi-GPU, real LMDB, SLURM. The fixture is not the training data.
 
-### Notebook saved-output audit
+#### Notebook saved-output audit
 
 | Cells | Saved state |
 |---|---|
@@ -59,17 +102,17 @@ Not run locally: GPU, fp16, CUDA, multi-GPU, real LMDB, SLURM. The fixture is no
 
 The earlier "13/13 PASS" therefore cannot be reproduced from this notebook copy. Its useful parts are reproduced and extended by the tests above.
 
-## 3. HPC verification required (NOT RUN; only you can run these)
+### 3. HPC verification required (NOT RUN; only you can run these)
 
 1. `check_heart_env.sh` on the login node and as an `sbatch` GPU job: `heart_gpu` imports, `unicore-train`, registry, CUDA and fp16 on the allocated T4/H200.
 2. Uni-Core installed into `heart_gpu` at `ace6fae` (pure-Python build).
 3. `inspect_real_lmdb.py --pipeline` on the real `train.lmdb`/`valid.lmdb`/`dict.txt`: counts, contiguous keys, record layout, conformers per record, hydrogens present, dictionary coverage, RDKit atom-order agreement for the 2D view.
-4. 10-update GPU pilot (`configs/pilot.yaml`): real-data forward and backward at LUMI base size with fp16, per-objective losses, bounded validation, checkpoints, wall time and `gb_free`.
+4. 10-update GPU pilot (now `scripts/pretrain_smoke.sh`): real-data forward and backward at LUMI base size with fp16, per-objective losses, bounded validation, checkpoints, wall time and `gb_free`.
 5. `verify_checkpoint.py` on the pilot checkpoint, then the resume job to 12 updates.
 6. Batch-size memory probe on the H200, and the real checkpoint size.
 7. Multi-GPU (`torchrun`) path, if it is ever used.
 
-## 4. Remaining blockers and risks
+### 4. Remaining blockers and risks
 
 - **Uni-Core in `heart_gpu` is unverified.** It must be installed (README Stage A). If pip has no network access on CMRI, use the ZIP or scp route.
 - **Real-data assumptions are unconfirmed.** Hydrogens present, conformers stored as a list of `(N,3)` arrays, keys `0..N-1`, and an RDKit `AddHs` order that matches `atoms` all need step 3 above. If the RDKit atom-order check fails, the 2D view will pair coordinates with the wrong atoms. In that case, disable the 2D view or fix it before full training.

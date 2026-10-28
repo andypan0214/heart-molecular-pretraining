@@ -16,10 +16,10 @@ Checks
      collate one batch, printing tensor shapes (needs Uni-Core; run from the
      model root so ./unimol is importable).
 
-Usage (from /home/ypan/heart_liver/model):
+Usage (from /home/ypan/heart_liver/model_train/heart-molecular-pretraining/model):
     python pretrain/tools/inspect_real_lmdb.py \
-        /home/ypan/heart_liver/model/UniMolReference/ligand_data/ligands \
-        --samples 5 --pipeline --json heart_training_runs/inspect_real_lmdb.json
+        /home/ypan/heart_liver/model_train/UniMolReference/ligand_data/ligands \
+        --samples 5 --pipeline --json ../runs/inspect_real_lmdb.json
 """
 import argparse
 import json

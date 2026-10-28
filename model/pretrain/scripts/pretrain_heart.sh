@@ -1,267 +1,257 @@
 #!/bin/bash
-#SBATCH --job-name=heart-pretrain-test
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=6
-#SBATCH --mem=55G
+#SBATCH --cpus-per-task=16
+#SBATCH --job-name=heart-pretrain-full
+#SBATCH --mem=128G
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpu
-#SBATCH --time=00:30:00
-#SBATCH --output=/home/ypan/heart_liver/model/pretrain/logs/%x-%j.out
-#SBATCH --error=/home/ypan/heart_liver/model/pretrain/logs/%x-%j.err
+#SBATCH --time=2-00:00:00
+#SBATCH --signal=B:USR1@1800
+#SBATCH --output=/home/ypan/heart_liver/model_train/heart-molecular-pretraining/runs/slurm/%x-%j.out
+#SBATCH --error=/home/ypan/heart_liver/model_train/heart-molecular-pretraining/runs/slurm/%x-%j.err
 # =============================================================================
-# HEART general molecular pretraining -- SLURM launcher for CMRI HPC.
+# HEART FULL general molecular pretraining (random initialisation, Uni-Mol
+# ligand LMDB, LUMI-lab objectives). This is the production launcher; the
+# 10-update engineering test is scripts/pretrain_smoke.sh.
 #
-# Adapted from CMRI_pretrian.txt (the user's CMRI edit of LUMI-lab
-# model/pretrain/pretrain.sh). Same Uni-Core workflow:
-#   unicore-train <data> --user-dir ./unimol --task unimol_contrastive
-#       --loss unimol_contrastive --arch unimol_contrastive_base ...
-# Changes vs. CMRI_pretrian.txt are listed in pretrain/IMPLEMENTATION_MAP.md.
+# Same Uni-Core workflow as LUMI-lab model/pretrain/pretrain.sh, with the CMRI
+# environment and these guards:
+#   * refuses to start unless HEART_CONFIRM_FULL=1, BATCH_SIZE is given
+#     explicitly (micro-batch chosen from a VRAM probe) and HEART_SMOKE_RUN
+#     points to a smoke run whose smoke_result-*.txt says verdict=PASS;
+#   * checks GPU memory, free disk, CPU count and SLURM time left first;
+#   * fixed run directory runs/full/<RUN_NAME>: every resubmission resumes from
+#     checkpoint_last.pt (model, optimizer, LR schedule, fp16 scaler, data
+#     position) and refuses changed scientific settings;
+#   * stops cleanly before the SLURM limit: --stop-time-hours = cumulative
+#     training time + (time left - 30 min); Uni-Core then validates, writes
+#     checkpoint_last.pt and exits 0. SIGUSR1 (sent 30 min before the limit)
+#     and SIGTERM are logged and forwarded only if training is still running.
 #
-# Usage (the logs/ directory must exist BEFORE sbatch, or SLURM drops output):
-#   cd /home/ypan/heart_liver/model/pretrain && mkdir -p logs
-#   sbatch scripts/pretrain_heart.sh configs/pilot.yaml                # 10-update pilot
-#   RESUME_DIR=<run dir> MAX_UPDATE=12 \
-#       sbatch scripts/pretrain_heart.sh configs/pilot.yaml            # resume test
-#   HEART_CONFIRM_FULL=1 sbatch <resource overrides> \
-#       scripts/pretrain_heart.sh configs/full_pretrain.yaml           # full run (later)
+# Never submitted automatically. Typical submission (H200 GRES name: sinfo -o "%P %G"):
+#   cd /home/ypan/heart_liver/model_train/heart-molecular-pretraining/model/pretrain
+#   HEART_CONFIRM_FULL=1 BATCH_SIZE=<probed> UPDATE_FREQ=1 \
+#   HEART_SMOKE_RUN=<runs/smoke/heart-smoke-test-...> \
+#       sbatch --gres=gpu:<h200-type>:1 scripts/pretrain_heart.sh
+# Continue after a time limit (same command; or chain with --dependency=afterany:<jobid>).
+# Pre-flight only, on the login node (no training, nothing created):
+#   HEART_DRY_RUN=1 HEART_CONFIRM_FULL=1 BATCH_SIZE=... HEART_SMOKE_RUN=... bash scripts/pretrain_heart.sh
 #
-# Environment overrides (all optional):
-#   RESUME_DIR=<dir>      reuse an existing run directory (auto-resumes from
-#                         <dir>/checkpoint_last.pt)
-#   MAX_UPDATE=<n>        override unicore max-update (e.g. resume test)
-#   HEART_SET="k=v ..."   extra config overrides, e.g. "batch-size=8 max-valid-steps=2"
-#   HEART_CONFIRM_FULL=1  required for configs with requires_confirmation: true
-#   HEART_DRY_RUN=1       run all pre-flight checks, print the command, exit
-#   HEART_MODEL_ROOT, HEART_CONDA_MODULE, HEART_CONDA_SH, HEART_CONDA_ENV
-#   HEART_SKIP_ENV=1, HEART_PYTHON, HEART_TRAIN_ENTRY
-#                         local-testing hooks: skip module/conda activation and
-#                         choose the interpreter / training entry point
+# Optional overrides: RUN_NAME, UPDATE_FREQ, NUM_WORKERS, MIN_GPU_MEM_GB (40),
+#   MIN_FREE_GB (50), STOP_MARGIN_MINUTES (30), N_GPU (1; >1 uses torchrun, untested),
+#   HEART_ALLOW_ARG_CHANGE=1 (resume despite changed settings), plus the
+#   HEART_* path variables of heart_lib.sh. Local CPU testing hooks as in
+#   pretrain_smoke.sh.
 # =============================================================================
 set -eo pipefail
 
-die() { echo "ERROR: $*" >&2; exit 1; }
-log() { echo "[heart $(date '+%F %T')] $*"; }
+# >>> Locate the repository (sbatch runs a spooled copy of this file) >>>
+script_path="${BASH_SOURCE[0]}"
+if [ -z "${HEART_REPO:-}" ] && [ -n "${SLURM_JOB_ID:-}" ] && command -v scontrol >/dev/null 2>&1; then
+    submitted="$(scontrol show job "$SLURM_JOB_ID" 2>/dev/null | sed -n 's/^ *Command=//p' | head -1)"
+    submitted="${submitted%% *}"
+    [ -n "$submitted" ] && [ -f "$submitted" ] && script_path="$submitted"
+fi
+lib="$(dirname "$script_path")/heart_lib.sh"
+[ -f "$lib" ] || lib="${HEART_REPO:-/home/ypan/heart_liver/model_train/heart-molecular-pretraining}/model/pretrain/scripts/heart_lib.sh"
+# shellcheck source=heart_lib.sh
+. "$lib"
+heart_find_repo "$script_path"
+heart_paths
+
+# >>> Gate 1: explicit human confirmation (checked before anything else) >>>
+[ "${HEART_CONFIRM_FULL:-0}" = "1" ] || die "full pretraining requires HEART_CONFIRM_FULL=1 (after the smoke test has passed; see README_HEART.md)"
+[ -n "${BATCH_SIZE:-}" ] || die "set BATCH_SIZE explicitly: per-GPU micro-batch chosen from the VRAM probe (README_HEART.md, Stage D)"
+[ -n "${HEART_SMOKE_RUN:-}" ] || die "set HEART_SMOKE_RUN to the smoke run directory whose smoke_result-*.txt says verdict=PASS"
 
 # >>> Heart Slurm information >>>
-echo "SLURM_JOBID=${SLURM_JOBID:-}"
-echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST:-}"
-echo "SLURM_JOB_PARTITION=${SLURM_JOB_PARTITION:-}"
-echo "SLURM_NNODES=${SLURM_NNODES:-}"
-echo "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-}"
-echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-}"
-echo "SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-}"
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+heart_slurm_info
+heart_print_paths
 
-# >>> Paths >>>
-MODEL_ROOT="${HEART_MODEL_ROOT:-/home/ypan/heart_liver/model}"
-PRETRAIN_DIR="$MODEL_ROOT/pretrain"
-CONFIG="${1:-$PRETRAIN_DIR/configs/pilot.yaml}"
-if [ ! -f "$CONFIG" ] && [ -f "$PRETRAIN_DIR/$CONFIG" ]; then
-    CONFIG="$PRETRAIN_DIR/$CONFIG"
-fi
-[ -f "$CONFIG" ] || die "config not found: $CONFIG"
-CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
-[ -d "$MODEL_ROOT/unimol" ] || die "$MODEL_ROOT/unimol not found (unimol/ must be a sibling of pretrain/)"
-log "model root : $MODEL_ROOT"
-log "config     : $CONFIG"
+# >>> conda initialize (heart_gpu; this script never installs packages) >>>
+heart_activate_env
+heart_runtime_env
 
-# >>> Runtime environment >>>
-export PYTHONNOUSERSITE=1          # ignore ~/.local site-packages
-export NCCL_IB_DISABLE=1
-export NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-# One BLAS/OpenMP thread per process: the DataLoader workers already use the
-# allocated cores (the original OMP_NUM_THREADS=6 per worker oversubscribes).
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# >>> HEART full-pretraining parameters (LUMI-lab pretrain.sh reference values) >>>
+run_name="${RUN_NAME:-heart-pretrain-full-v1}"
+n_gpu="${N_GPU:-1}"
+num_workers="${NUM_WORKERS:-$(( ${SLURM_CPUS_PER_TASK:-6} > 1 ? ${SLURM_CPUS_PER_TASK:-6} - 1 : 0 ))}"
+lr=1e-5
+wd=1e-4
+batch_size="$BATCH_SIZE"               # micro-batch: molecules per GPU per forward (x2 views); LUMI used 448
+batch_size_valid="$batch_size"
+update_freq="${UPDATE_FREQ:-1}"        # gradient accumulation steps
+heads=64
+masked_token_loss=1
+masked_coord_loss=5
+masked_dist_loss=10
+x_norm_loss=0.01
+delta_pair_repr_norm_loss=0.01
+contrastive_loss=10.0
+contrastive_view_mode=independent      # HEART P3 (same as the smoke test); LUMI stock data path == identical
+mask_prob=0.15
+only_polar=0
+noise_type="uniform"
+noise=1.0
+max_atoms=256
+seed=1
+warmup_steps=10000
+max_steps=1000000
+log_interval=100
+validate_interval_updates=10000
+save_interval_updates=10000
+keep_interval_updates=10               # + checkpoint_last.pt + checkpoint_best.pt
+stop_margin_minutes="${STOP_MARGIN_MINUTES:-30}"
+min_gpu_mem_gb="${MIN_GPU_MEM_GB:-40}"
+min_free_gb="${MIN_FREE_GB:-50}"
 
-# >>> conda initialize >>>
-CONDA_MODULE="${HEART_CONDA_MODULE:-miniconda3/py311_24.1.2}"
-CONDA_SH="${HEART_CONDA_SH:-/mnt/software/miniconda3/py311_24.1.2/etc/profile.d/conda.sh}"
-CONDA_ENV="${HEART_CONDA_ENV:-/home/ypan/.conda/envs/heart_gpu}"
-if [ "${HEART_SKIP_ENV:-0}" != "1" ]; then
-    if ! type module >/dev/null 2>&1; then
-        for f in /etc/profile.d/lmod.sh /etc/profile.d/modules.sh; do
-            # shellcheck disable=SC1090
-            [ -f "$f" ] && . "$f"
-        done
-    fi
-    if type module >/dev/null 2>&1; then
-        module load "$CONDA_MODULE" || log "WARNING: 'module load $CONDA_MODULE' failed; using $CONDA_SH directly"
-    fi
-    [ -f "$CONDA_SH" ] || die "conda bootstrap not found: $CONDA_SH"
-    # shellcheck disable=SC1090
-    source "$CONDA_SH"
-    conda activate "$CONDA_ENV" || die "cannot activate $CONDA_ENV"
-fi
-PY="${HEART_PYTHON:-python}"
-
-echo "=== Python ==="
-command -v "$PY" || die "python not found"
-"$PY" --version
-"$PY" -c 'import sys; print(sys.executable)'
-
-# >>> HEART config >>>
-SET_ARGS=()
-for kv in ${HEART_SET:-}; do SET_ARGS+=(--set "$kv"); done
-[ -n "${MAX_UPDATE:-}" ] && SET_ARGS+=(--set "max-update=$MAX_UPDATE")
-CFG_SH="$("$PY" "$PRETRAIN_DIR/tools/yaml_to_env.py" "$CONFIG" "${SET_ARGS[@]}")" || die "invalid config $CONFIG"
-eval "$CFG_SH"
-
-if [ "${HEART_REQUIRES_CONFIRMATION:-0}" = "1" ] && [ "${HEART_CONFIRM_FULL:-0}" != "1" ]; then
-    die "$CONFIG is a full-scale config; resubmit with HEART_CONFIRM_FULL=1 once the pilot has passed"
-fi
-
-data_path="$HEART_DATA_PATH"
-n_gpu="${HEART_N_GPU:-1}"
-USE_CPU=0
-for a in "${HEART_UNICORE_ARGS[@]}"; do [ "$a" = "--cpu" ] && USE_CPU=1; done
-
-# Cap DataLoader workers at (allocated CPUs - 1); the main process needs one.
-if [ -n "${SLURM_CPUS_PER_TASK:-}" ]; then
-    max_workers=$(( SLURM_CPUS_PER_TASK > 1 ? SLURM_CPUS_PER_TASK - 1 : 1 ))
-    for i in "${!HEART_UNICORE_ARGS[@]}"; do
-        if [ "${HEART_UNICORE_ARGS[$i]}" = "--num-workers" ]; then
-            j=$((i + 1))
-            if [ "${HEART_UNICORE_ARGS[$j]}" -gt "$max_workers" ]; then
-                log "num-workers ${HEART_UNICORE_ARGS[$j]} -> $max_workers (SLURM_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK)"
-                HEART_UNICORE_ARGS[$j]=$max_workers
-            fi
-        fi
-    done
-fi
-
-# >>> Pre-flight: dataset (read-only) >>>
-for f in train.lmdb valid.lmdb dict.txt; do
-    [ -r "$data_path/$f" ] || die "missing or unreadable: $data_path/$f"
+for v in batch_size update_freq n_gpu num_workers stop_margin_minutes min_free_gb; do
+    case "${!v}" in ''|*[!0-9]*) die "$v must be a non-negative integer (got '${!v}')" ;; esac
 done
-ls -lh "$data_path/train.lmdb" "$data_path/valid.lmdb" "$data_path/dict.txt"
+[ "$batch_size" -ge 1 ] && [ "$update_freq" -ge 1 ] && [ "$n_gpu" -ge 1 ] || die "BATCH_SIZE, UPDATE_FREQ and N_GPU must be >= 1"
+effective_batch=$(( batch_size * update_freq * n_gpu ))
+log "micro-batch $batch_size x update-freq $update_freq x GPUs $n_gpu = effective $effective_batch molecules/update"
+log "NT-Xent negatives come from one micro-batch per GPU (gathered across GPUs): $(( 2 * batch_size * n_gpu - 2 )) per positive pair"
+[ "$update_freq" -gt 1 ] && warn "update-freq $update_freq: accumulation reproduces the effective batch for the reconstruction losses, not for the contrastive negatives"
 
-# >>> Run directory >>>
-if [ -n "${RESUME_DIR:-}" ]; then
-    save_dir="$RESUME_DIR"
-    [ -f "$save_dir/checkpoint_last.pt" ] || die "RESUME_DIR has no checkpoint_last.pt: $save_dir"
-elif [ "$HEART_RUN_DIR_MODE" = "fixed" ]; then
-    save_dir="$HEART_OUTPUT_ROOT/$HEART_RUN_NAME"
-else
-    save_dir="$HEART_OUTPUT_ROOT/${HEART_RUN_NAME}-$(date '+%Y%m%d-%H%M')-j${SLURM_JOB_ID:-local}"
+precision_args=(--fp16 --fp16-init-scale 4 --fp16-scale-window 256)
+USE_CPU=0
+if [ "${HEART_LOCAL_CPU_TEST:-0}" = "1" ]; then
+    precision_args=(--cpu)             # local CPU test suite only; never on CMRI
+    USE_CPU=1
 fi
+read -r -a extra_args <<< "${HEART_EXTRA_ARGS:-}"
+heart_reject_forbidden_args "${extra_args[@]}"
+
 DRY_RUN="${HEART_DRY_RUN:-0}"
-mkdir -p "$HEART_OUTPUT_ROOT" || die "cannot create $HEART_OUTPUT_ROOT"
-probe="$HEART_OUTPUT_ROOT/.heart_write_test_$$"
-{ touch "$probe" && rm -f "$probe"; } || die "$HEART_OUTPUT_ROOT is not writable"
-save_dir="$(realpath -m "$save_dir")"
-data_abs="$(realpath -m "$data_path")"
-case "$save_dir/" in "$data_abs"/*) die "save dir must not be inside the dataset directory" ;; esac
-case "$data_abs/" in "$save_dir"/*) die "save dir must not contain the dataset" ;; esac
-if [ "$DRY_RUN" != "1" ]; then
-    mkdir -p "$save_dir" || die "cannot create $save_dir"
+if [ -z "${SLURM_JOB_ID:-}" ] && [ "$DRY_RUN" != "1" ] && [ "$USE_CPU" != "1" ]; then
+    die "full pretraining runs only under sbatch (use HEART_DRY_RUN=1 for a login-node pre-flight)"
 fi
+
+# >>> Gate 2: evidence that the smoke test passed >>>
+smoke_dir="$(realpath -m "$HEART_SMOKE_RUN")"
+smoke_pass=""
+smoke_resume=""
+for f in "$smoke_dir"/smoke_result-*.txt; do
+    [ -f "$f" ] && grep -qx 'verdict=PASS' "$f" || continue
+    n="$(sed -n 's/^max_update=//p' "$f")"
+    [ "${n:-0}" -ge 10 ] 2>/dev/null || continue
+    smoke_pass="$f"
+    grep -q '^resume_from=[0-9]' "$f" && smoke_resume="$f"
+done
+[ -n "$smoke_pass" ] || die "no smoke_result-*.txt with verdict=PASS and max_update>=10 in $smoke_dir"
+log "smoke evidence: $smoke_pass"
+[ -n "$smoke_resume" ] && log "smoke resume evidence: $smoke_resume" \
+    || warn "no passed smoke RESUME test in $smoke_dir (recommended before long runs)"
+
+# >>> Pre-flight: real dataset, opened read-only >>>
+heart_check_data
+
+# >>> Fixed run directory: resubmission resumes >>>
+save_dir="$OUTPUT_ROOT/full/$run_name"
+heart_check_save_dir "$save_dir"
+mkdir -p "$OUTPUT_ROOT/full"
+free_gb="$(df -Pk "$OUTPUT_ROOT/full" | awk 'NR==2 {print int($4/1048576)}')"
+log "free disk under $OUTPUT_ROOT/full: ${free_gb} GiB (need >= $min_free_gb)"
+[ "$free_gb" -ge "$min_free_gb" ] || die "less than $min_free_gb GiB free for checkpoints (~0.6-0.8 GB each, up to 12 kept)"
+if [ -n "${SLURM_CPUS_PER_TASK:-}" ] && [ "$num_workers" -ge "$SLURM_CPUS_PER_TASK" ]; then
+    die "NUM_WORKERS=$num_workers must be < SLURM_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK"
+fi
+
+resume_from=""
 if [ -f "$save_dir/checkpoint_last.pt" ]; then
-    log "run dir    : $save_dir (RESUMING from checkpoint_last.pt)"
+    resume_from="$(heart_ckpt_updates "$save_dir/checkpoint_last.pt")" || die "cannot read $save_dir/checkpoint_last.pt"
+    [ "$resume_from" -lt "$max_steps" ] || die "run already reached $resume_from updates (max $max_steps)"
+    log "run dir    : $save_dir (RESUMING from checkpoint_last.pt @ $resume_from updates)"
 else
     log "run dir    : $save_dir (new run, random initialisation)"
 fi
-echo "=== Storage ==="
-df -h "$HEART_OUTPUT_ROOT" || true
-command -v quota >/dev/null 2>&1 && { quota -s 2>/dev/null || true; }
 
-# >>> Pre-flight: GPU / PyTorch >>>
-echo "=== GPU ==="
-if [ "$USE_CPU" = "1" ]; then
-    log "--cpu requested: skipping GPU checks (local testing only)"
-else
-    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || log "WARNING: nvidia-smi not available"
-fi
-echo "=== PyTorch ==="
-# A dry run outside a SLURM job (e.g. on the login node) only warns about CUDA.
-GPU_OPTIONAL=0
-[ "$DRY_RUN" = "1" ] && [ -z "${SLURM_JOB_ID:-}" ] && GPU_OPTIONAL=1
-"$PY" - "$USE_CPU" "${HEART_MIN_GPU_MEM_GB:-0}" "$GPU_OPTIONAL" <<'PYEOF' || die "PyTorch/CUDA pre-flight failed"
-import sys, torch
-use_cpu, min_gb, gpu_optional = sys.argv[1] == "1", float(sys.argv[2]), sys.argv[3] == "1"
-print("torch", torch.__version__, "| CUDA build", torch.version.cuda,
-      "| cuda available", torch.cuda.is_available())
-if not use_cpu:
-    if not torch.cuda.is_available():
-        if gpu_optional:
-            print("WARNING: no GPU visible (dry run outside SLURM); GPU checks skipped")
-            sys.exit(0)
-        sys.exit("CUDA is not available in this job")
-    for i in range(torch.cuda.device_count()):
-        p = torch.cuda.get_device_properties(i)
-        print("GPU{}: {} | {:.1f} GiB | sm_{}{}".format(i, p.name, p.total_memory / 2**30, p.major, p.minor))
-    x = torch.randn(256, 256, device="cuda", dtype=torch.float16)
-    print("fp16 matmul OK:", float((x @ x).float().abs().mean()) > 0)
-    gb = torch.cuda.get_device_properties(0).total_memory / 2**30
-    if gb < min_gb:
-        sys.exit("GPU0 has {:.1f} GiB < min_gpu_mem_gb {} required by this config".format(gb, min_gb))
-PYEOF
-
-# >>> Pre-flight: Uni-Core + ./unimol registrations >>>
-cd "$MODEL_ROOT"
-"$PY" "$PRETRAIN_DIR/tools/check_registry.py" --user-dir ./unimol || die "Uni-Core cannot discover the unimol_contrastive registrations"
-if [ -n "${HEART_TRAIN_ENTRY:-}" ]; then
-    read -r -a TRAIN_ENTRY <<< "$HEART_TRAIN_ENTRY"
-else
-    entry="$(command -v unicore-train || true)"
-    [ -n "$entry" ] || die "unicore-train not on PATH (install Uni-Core into $CONDA_ENV, see README_HEART.md)"
-    TRAIN_ENTRY=("$entry")
-fi
-
-# >>> SLURM time-limit guard >>>
-STOP_ARGS=()
-if [ -n "${SLURM_JOB_ID:-}" ] && [ "${HEART_STOP_MARGIN_MINUTES:-0}" != "0" ] && command -v squeue >/dev/null 2>&1; then
-    time_left="$(squeue -h -j "$SLURM_JOB_ID" -o %L 2>/dev/null || true)"
-    stop_h="$("$PY" "$PRETRAIN_DIR/tools/stop_time_hours.py" --time-left "$time_left" \
-        --margin-minutes "$HEART_STOP_MARGIN_MINUTES" --save-dir "$save_dir")" || stop_h=0
-    if [ "$stop_h" != "0" ]; then
-        STOP_ARGS=(--stop-time-hours "$stop_h")
-        log "time left $time_left -> --stop-time-hours $stop_h (cumulative)"
-    fi
+# >>> Pre-flight: GPU / PyTorch / Uni-Core registry / time >>>
+gpu_optional=0
+[ "$DRY_RUN" = "1" ] && [ -z "${SLURM_JOB_ID:-}" ] && gpu_optional=1
+heart_gpu_preflight "$USE_CPU" "$min_gpu_mem_gb" "$gpu_optional"
+heart_registry_check
+heart_train_entry
+[ "$DRY_RUN" = "1" ] || mkdir -p "$save_dir"
+heart_stop_time_args "$save_dir" "$stop_margin_minutes"
+if [ -n "${SLURM_JOB_ID:-}" ] && [ "${#STOP_ARGS[@]}" -eq 0 ] && [ "$USE_CPU" != "1" ]; then
+    die "could not derive --stop-time-hours from the SLURM time limit; refusing an unguarded full run"
 fi
 
 # >>> Training command >>>
-CMD=("${TRAIN_ENTRY[@]}" "$data_path" --user-dir ./unimol
-     "${HEART_UNICORE_ARGS[@]}"
-     --save-dir "$save_dir" --tmp-save-dir "$save_dir"
-     --tensorboard-logdir "$save_dir/tsb"
-     "${STOP_ARGS[@]}")
+cd "$MODEL_ROOT"
+CMD=("${TRAIN_ENTRY[@]}" "$DATA_PATH" --user-dir ./unimol --train-subset train --valid-subset valid
+    --num-workers "$num_workers" --data-buffer-size 20 --ddp-backend=c10d
+    --task unimol_contrastive --loss unimol_contrastive --arch unimol_contrastive_base
+    --encoder-attention-heads "$heads"
+    --optimizer adam --adam-betas "(0.9, 0.99)" --adam-eps 1e-6 --clip-norm 1.0 --weight-decay "$wd"
+    --lr-scheduler polynomial_decay --lr "$lr" --warmup-updates "$warmup_steps" --total-num-update "$max_steps"
+    --update-freq "$update_freq" --seed "$seed"
+    "${precision_args[@]}" --tensorboard-logdir "$save_dir/tsb"
+    --max-update "$max_steps" --log-interval "$log_interval" --log-format simple
+    --save-interval-updates "$save_interval_updates" --validate-interval-updates "$validate_interval_updates"
+    --keep-interval-updates "$keep_interval_updates" --no-epoch-checkpoints
+    --masked-token-loss "$masked_token_loss" --masked-coord-loss "$masked_coord_loss" --masked-dist-loss "$masked_dist_loss"
+    --x-norm-loss "$x_norm_loss" --delta-pair-repr-norm-loss "$delta_pair_repr_norm_loss"
+    --mask-prob "$mask_prob" --noise-type "$noise_type" --noise "$noise" --max-atoms "$max_atoms"
+    --batch-size "$batch_size" --batch-size-valid "$batch_size_valid"
+    --save-dir "$save_dir" --tmp-save-dir "$save_dir" --only-polar "$only_polar" --mode train
+    --dict-name dict.txt --contrastive-loss "$contrastive_loss" --contrastive-view-mode "$contrastive_view_mode"
+    "${STOP_ARGS[@]}" "${extra_args[@]}")
 if [ "$n_gpu" -gt 1 ]; then
-    # torchrun exports RANK/WORLD_SIZE/MASTER_*/LOCAL_RANK, which Uni-Core reads
-    # (it does not accept the --local-rank flag torch.distributed.launch adds).
+    # torchrun exports RANK/WORLD_SIZE/LOCAL_RANK, which Uni-Core reads
+    # (torch>=2 torch.distributed.launch passes --local-rank, which Uni-Core rejects).
     CMD=(torchrun --standalone --nproc_per_node="$n_gpu" "${CMD[@]}")
 fi
 
 echo "=== Command ==="
 printf '%q ' "${CMD[@]}"; echo
+if [ -n "$resume_from" ]; then
+    allow=(); [ "${HEART_ALLOW_ARG_CHANGE:-0}" = "1" ] && allow=(--allow-change)
+    "$PY" "$PRETRAIN_DIR/tools/check_resume_args.py" "$save_dir/checkpoint_last.pt" "${allow[@]}" -- "${CMD[@]}" \
+        || die "resume settings differ from the checkpoint (HEART_ALLOW_ARG_CHANGE=1 to override, and document why)"
+fi
 if [ "$DRY_RUN" = "1" ]; then
     log "HEART_DRY_RUN=1: pre-flight passed; would write to $save_dir; not training"
     exit 0
 fi
 
-# >>> Provenance (small text files only) >>>
-prov="$save_dir/provenance/job-${SLURM_JOB_ID:-local}-$(date '+%Y%m%d-%H%M%S')"
-mkdir -p "$prov"
-cp "$CONFIG" "$prov/"
-cp "$0" "$prov/pretrain_heart.sh.used" 2>/dev/null || true
-printf '%q ' "${CMD[@]}" > "$prov/command.txt"; echo >> "$prov/command.txt"
-(cd "$MODEL_ROOT" && find unimol pretrain/tools -name '*.py' -type f | sort | xargs sha256sum) > "$prov/source_sha256.txt" 2>/dev/null || true
-"$PY" -m pip freeze > "$prov/pip_freeze.txt" 2>/dev/null || true
-{ env | grep -E '^(SLURM_|CUDA_|PYTORCH_|OMP_|HEART_)' | sort; } > "$prov/env.txt" || true
-log "provenance : $prov"
-
+heart_provenance "$save_dir" "$script_path" "${CMD[@]}"
 train_log="$save_dir/train-${SLURM_JOB_ID:-local}.log"
 log "training log: $train_log"
+
+# >>> Run in the background so SLURM signals reach this shell >>>
+train_pid=""
+on_signal() {
+    log "received SIG$1: Uni-Core stops itself at --stop-time-hours (validate + checkpoint_last.pt)"
+    if [ "$1" = TERM ] && [ -n "$train_pid" ] && kill -0 "$train_pid" 2>/dev/null; then
+        log "SIGTERM: forwarding to training (pid $train_pid); resume from the last saved checkpoint"
+        kill -TERM "$train_pid" 2>/dev/null || true
+    fi
+}
+trap 'on_signal USR1' USR1
+trap 'on_signal TERM' TERM
 set +e
-"${CMD[@]}" 2>&1 | tee -a "$train_log"
-rc=${PIPESTATUS[0]}
-set -e
+"${CMD[@]}" > >(tee -a "$train_log") 2>&1 &
+train_pid=$!
+rc=0
+while :; do
+    wait "$train_pid"
+    rc=$?
+    # wait returns >128 when interrupted by a trapped signal; keep waiting
+    kill -0 "$train_pid" 2>/dev/null || break
+done
+trap - USR1 TERM
 
 echo "=== Summary ==="
 "$PY" "$PRETRAIN_DIR/tools/summarize_log.py" "$train_log" || log "summary reported FAIL items (see above)"
 ls -lh "$save_dir"
+if [ -f "$save_dir/checkpoint_last.pt" ]; then
+    now="$(heart_ckpt_updates "$save_dir/checkpoint_last.pt" || echo '?')"
+    log "checkpoint_last.pt @ $now / $max_steps updates"
+    [ "$now" != "$max_steps" ] && log "not finished: resubmit the same command to resume from $now updates"
+fi
 log "training exit code: $rc"
 exit "$rc"

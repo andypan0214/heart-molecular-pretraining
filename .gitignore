@@ -1,8 +1,10 @@
 # local environments / caches
 .venv_heart_cpu/
+.venv*/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ipynb_checkpoints/
 # never commit data, checkpoints or run outputs
 *.lmdb
 *.lmdb-lock
@@ -13,3 +15,12 @@ logs/
 heart_training_runs/
 tsb/
 third_party/
+# runs/: SLURM logs, smoke/full run directories, env-fix logs. Only the empty
+# runs/slurm/ directory is tracked so that it exists before the first sbatch.
+runs/*
+!runs/slurm/
+runs/slurm/*
+!runs/slurm/.gitkeep
+# secrets
+.env
+*.token

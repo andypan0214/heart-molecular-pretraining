@@ -1,16 +1,20 @@
 # Python packages HEART pretraining needs inside the heart_gpu conda env
-# (/home/ypan/.conda/envs/heart_gpu). torch is NOT listed: keep the existing
-# torch 2.2.2+cu121 build and do not let pip replace it.
+# (/home/ypan/.conda/envs/heart_gpu, Python 3.11). Read by
+# tools/heart_env_check.py; repaired only by `bash scripts/check_heart_env.sh --fix`.
 #
-#   python -m pip install -r requirements-heart.txt
-#   then Uni-Core from source (see README_HEART.md, step 2):
-#   python -m pip install --no-build-isolation --no-deps <Uni-Core checkout @ ace6fae>
-numpy>=1.24,<2          # torch 2.2 wheels are built against NumPy 1.x
-lmdb>=1.4,<2
-rdkit==2024.9.6         # Add2DConformerDataset (2D view); version used in the CPU notebook
-scipy>=1.10,<1.14       # unimol.data.distance_dataset
-tokenizers<0.21         # imported unconditionally by unicore.data
-tensorboardX<3          # --tensorboard-logdir
-pyyaml>=6               # launcher configs
-tqdm
-pytest                  # optional: run pretrain/tests on HPC
+# torch is NOT listed: the existing torch 2.2.2+cu121 build is checked but never
+# installed or upgraded; every repair runs with a torch==<installed> constraint.
+# Uni-Core is NOT listed: it is installed from the existing source checkout
+# /home/ypan/heart_liver/model_train/third_party/Uni-Core @ ace6fae (--no-deps).
+#
+# Format: <accepted versions>   # install: <pin used only when a repair is needed>
+numpy>=1.24,<2          # install: numpy==1.26.4    torch 2.2 wheels are built against NumPy 1.x
+lmdb>=1.4,<2            # install: lmdb==1.4.1
+rdkit>=2022.9,<2026     # install: rdkit==2024.9.6  Add2DConformerDataset (2D view)
+scipy>=1.10,<1.14       # install: scipy==1.13.1    unimol.data.distance_dataset
+tokenizers<0.21         # install: tokenizers==0.20.3  imported unconditionally by unicore.data
+tensorboardX>=2.5,<3    # install: tensorboardX==2.6.2.2  --tensorboard-logdir
+pyyaml>=6               # install: pyyaml==6.0.2    configs, tools
+tqdm>=4                 # install: tqdm==4.66.5
+ipykernel>=6            # install: ipykernel==6.29.5  Jupyter kernel for HEART_HPC_Validation.ipynb
+pytest>=7               # install: pytest==8.3.3    optional: run pretrain/tests on HPC

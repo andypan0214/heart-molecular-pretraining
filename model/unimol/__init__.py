@@ -1,7 +1,8 @@
 # HEART general molecular pretraining -- Uni-Core user module.
 #
 # Loaded by `unicore-train ... --user-dir ./unimol` from the model root
-# (/home/ypan/heart_liver/model on CMRI HPC). Importing the sub-packages
+# (/home/ypan/heart_liver/model_train/heart-molecular-pretraining/model on
+# CMRI HPC). Importing the sub-packages
 # registers the task/model/architecture/loss used by HEART:
 #   task  unimol_contrastive          (tasks/unimol_contrastive.py)
 #   model unimol_contrastive, arch unimol_contrastive_base
